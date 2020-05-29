@@ -25,6 +25,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Table;
 import com.google.gson.stream.JsonReader;
+import org.apache.commons.io.IOUtils;
 import org.apache.flume.Event;
 import org.apache.flume.FlumeException;
 import org.apache.flume.annotations.InterfaceAudience;
@@ -33,10 +34,7 @@ import org.apache.flume.client.avro.ReliableEventReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileReader;
-import java.io.IOException;
+import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.util.Arrays;
@@ -56,6 +54,9 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
   private Map<Long, TailFile> tailFiles = Maps.newHashMap();
   private long updateTime;
   private boolean addByteOffset;
+  private boolean addLineNum;
+  private String bodyPrefix;
+  private String bodyPostfix;
   private boolean cachePatternMatching;
   private boolean committed = true;
   private final boolean annotateFileName;
@@ -67,7 +68,7 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
   private ReliableTaildirEventReader(Map<String, String> filePaths,
       Table<String, String, String> headerTable, String positionFilePath,
       boolean skipToEnd, boolean addByteOffset, boolean cachePatternMatching,
-      boolean annotateFileName, String fileNameHeader) throws IOException {
+      boolean annotateFileName, String fileNameHeader, boolean addLineNum, String bodyPrefix, String bodyPostfix) throws IOException {
     // Sanity checks
     Preconditions.checkNotNull(filePaths);
     Preconditions.checkNotNull(positionFilePath);
@@ -90,6 +91,10 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
     this.cachePatternMatching = cachePatternMatching;
     this.annotateFileName = annotateFileName;
     this.fileNameHeader = fileNameHeader;
+    this.addLineNum = addLineNum;
+    this.bodyPostfix = bodyPostfix;
+    this.bodyPrefix = bodyPrefix;
+    this.addLineNum = addLineNum;
     updateTailFiles(skipToEnd);
 
     logger.info("Updating position from position file: " + positionFilePath);
@@ -101,7 +106,7 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
    * If the position file exists, update tailFiles mapping.
    */
   public void loadPositionFile(String filePath) {
-    Long inode, pos;
+    Long inode, pos, filesize, lineNum, lastUpdateTime;
     String path;
     FileReader fr = null;
     JsonReader jr = null;
@@ -111,33 +116,48 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
       jr.beginArray();
       while (jr.hasNext()) {
         inode = null;
-        pos = null;
         path = null;
+        filesize = null;
+        lineNum = null;
+        lastUpdateTime = null;
+        pos = null;
         jr.beginObject();
         while (jr.hasNext()) {
           switch (jr.nextName()) {
             case "inode":
               inode = jr.nextLong();
               break;
+            case "file":
+              path = jr.nextString();
+              break;
             case "pos":
               pos = jr.nextLong();
               break;
-            case "file":
-              path = jr.nextString();
+            case "filesize":
+              filesize = jr.nextLong();
+              break;
+            case "lineNum":
+              lineNum = jr.nextLong();
+              break;
+            case "lastUpdateTime":
+              lastUpdateTime = jr.nextLong();
               break;
           }
         }
         jr.endObject();
 
-        for (Object v : Arrays.asList(inode, pos, path)) {
+        for (Object v : Arrays.asList(inode, pos, path, filesize,lineNum,lastUpdateTime)) {
           Preconditions.checkNotNull(v, "Detected missing value in position file. "
-              + "inode: " + inode + ", pos: " + pos + ", path: " + path);
+              + "inode: " + inode + ", pos: " + pos + ", path: " + path + ", filesize: " + filesize + ", lineNum: " + lineNum + ", lastUpdateTime: " + lastUpdateTime);
         }
         TailFile tf = tailFiles.get(inode);
-        if (tf != null && tf.updatePos(path, inode, pos)) {
+        //判断如果tf不为空并且tf与f不一致。如果名称修改了，会造成inode pos数据不更新
+        //if (tf != null && tf.updatePos(path, inode, pos)) {
+        //改为如果tf不为空，这里将tf与f保持一致（都传入tf，所以肯定一致）
+        if (tf != null && tf.updatePos(tf.getPath(), inode, pos, lineNum)) {
           tailFiles.put(inode, tf);
         } else {
-          logger.info("Missing file: " + path + ", inode: " + inode + ", pos: " + pos);
+          logger.info("Missing file: " + path + ", inode: " + inode + ", pos: " + pos + ", lineNum: " + lineNum);
         }
       }
       jr.endArray();
@@ -193,11 +213,12 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
       long lastPos = currentFile.getPos();
       currentFile.updateFilePos(lastPos);
     }
-    List<Event> events = currentFile.readEvents(numEvents, backoffWithoutNL, addByteOffset);
+    List<Event> events = currentFile.readEvents(numEvents, backoffWithoutNL, addByteOffset, addLineNum,bodyPrefix,bodyPostfix);
     if (events.isEmpty()) {
       return events;
     }
 
+    //将header写入event head
     Map<String, String> headers = currentFile.getHeaders();
     if (annotateFileName || (headers != null && !headers.isEmpty())) {
       for (Event event : events) {
@@ -225,7 +246,9 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
   public void commit() throws IOException {
     if (!committed && currentFile != null) {
       long pos = currentFile.getLineReadPos();
+      long lineNum = currentFile.getLineNum();
       currentFile.setPos(pos);
+      currentFile.setLineNum(lineNum);
       currentFile.setLastUpdated(updateTime);
       committed = true;
     }
@@ -251,19 +274,32 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
           continue;
         }
         TailFile tf = tailFiles.get(inode);
-        if (tf == null || !tf.getPath().equals(f.getAbsolutePath())) {
+        //此处代码有问题->如果文件被重命名,而且命名后仍然符合正则,将会被重新读取.
+        //if (tf == null || !tf.getPath().equals(f.getAbsolutePath())) {
+        //将!tf.getPath().equals(f.getAbsolutePath())这部分判断去掉即可,inode已经能唯一标识一个文件
+        if (tf == null) {
           long startPos = skipToEnd ? f.length() : 0;
-          tf = openFile(f, headers, inode, startPos);
+          long startLineNum = skipToEnd ? f.length() : 0;
+          tf = openFile(f, headers, inode, startPos, startLineNum);
         } else {
-          boolean updated = tf.getLastUpdated() < f.lastModified() || tf.getPos() != f.length();
+          boolean updated = tf.getLastUpdated() < f.lastModified() || tf.getPos() != f.length();//文件重命名后,如果没有对文件修改,f.lastModified时间不会变(即重命名操作不能影响Modify时间,影响的是Change时间)
           if (updated) {
-            if (tf.getRaf() == null) {
-              tf = openFile(f, headers, inode, tf.getPos());
-            }
-            if (f.length() < tf.getPos()) {
-              logger.info("Pos " + tf.getPos() + " is larger than file size! "
-                  + "Restarting from pos 0, file: " + tf.getPath() + ", inode: " + inode);
-              tf.updatePos(tf.getPath(), inode, 0);
+            //如果文件被重命名,那么重新打开重命名后的文件,按照之前记录的位置继续读取
+            if (!tf.getPath().equals(f.getAbsolutePath())) {
+              if (f.length() > tf.getPos()) {
+                tf = openFile(f, headers, inode, tf.getPos(),tf.getLineNum());
+              }
+            }else {
+              /**文件更新后,如果之前文件由于idle被关闭{@link TaildirSource#closeTailFiles()},那么重新打开文件*/
+              if (tf.getRaf() == null) {
+                tf = openFile(f, headers, inode, tf.getPos(), tf.getLineNum());
+              }
+              //如果原始文件中已经采集的部分行被删除 将导致f.length() < tf.getPos(),从头开始读取
+              if (f.length() < tf.getPos()) {
+                logger.info("Pos " + tf.getPos() + " is larger than file size! "
+                        + "Restarting from pos 0, file: " + tf.getPath() + ", inode: " + inode);
+                tf.updatePos(tf.getPath(), inode, 0, 0);
+              }
             }
           }
           tf.setNeedTail(updated);
@@ -279,16 +315,64 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
     return updateTailFiles(false);
   }
 
-
+    /**
+     * 得到文件inode,不同jdk版本采用不同方式
+     */
   private long getInode(File file) throws IOException {
+    if (!file.exists())
+        return 0;
+    String javaVersion = System.getProperty("java.version");
+    if (javaVersion.startsWith("1.6"))
+        return getInode_16(file);
+    else
+        return getInode_17(file);
+  }
+    /**
+     * 得到文件的inode,通过底层api得到 在jdk1.7以上的情况下使用
+     */
+  private long getInode_17(File file) throws IOException {
     long inode = (long) Files.getAttribute(file.toPath(), "unix:ino");
     return inode;
   }
 
-  private TailFile openFile(File file, Map<String, String> headers, long inode, long pos) {
+    /**
+     * 得到文件的inode,通过stat命令得到 在jdk1.6的情况下使用
+     */
+  public  long getInode_16(File file) throws IOException {
+    ProcessBuilder pb = new ProcessBuilder("sh", "-c", "stat " + file.toPath());
+    Process proc = pb.start();
+    InputStreamReader input = new InputStreamReader(proc.getInputStream());
+    BufferedReader br = new BufferedReader(input);
+    String str;
+    StringBuilder sb = new StringBuilder();
+    long inode = 0;
+    while ((str = br.readLine()) != null) {
+        int start = 0;
+        start = str.toLowerCase().indexOf("inode");
+        if (start != -1) {
+            for (int i = start + 5; i < str.length(); i++) {
+                if (str.charAt(i) >= 'a' && str.charAt(i) <= 'z')
+                    break;
+                if (str.charAt(i) >= '0' && str.charAt(i) <= '9')
+                    sb.append(str.charAt(i));
+            }
+            inode = Long.parseLong(sb.toString().trim());
+            break;
+        }
+    }
+    IOUtils.closeQuietly(proc.getInputStream());
+    IOUtils.closeQuietly(proc.getOutputStream());
+    IOUtils.closeQuietly(proc.getErrorStream());
+    proc.destroy();
+    input.close();
+    br.close();
+    return inode;
+  }
+
+  private TailFile openFile(File file, Map<String, String> headers, long inode, long pos, long linenum) {
     try {
       logger.info("Opening file: " + file + ", inode: " + inode + ", pos: " + pos);
-      return new TailFile(file, headers, inode, pos);
+      return new TailFile(file, headers, inode, pos, linenum);
     } catch (IOException e) {
       throw new FlumeException("Failed opening file: " + file, e);
     }
@@ -303,6 +387,9 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
     private String positionFilePath;
     private boolean skipToEnd;
     private boolean addByteOffset;
+    private boolean addLineNum;
+    private String bodyPrefix;
+    private String bodyPostfix;
     private boolean cachePatternMatching;
     private Boolean annotateFileName =
             TaildirSourceConfigurationConstants.DEFAULT_FILE_HEADER;
@@ -334,6 +421,11 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
       return this;
     }
 
+    public Builder addLineNum(boolean addLineNum) {
+      this.addLineNum = addLineNum;
+      return this;
+    }
+
     public Builder cachePatternMatching(boolean cachePatternMatching) {
       this.cachePatternMatching = cachePatternMatching;
       return this;
@@ -349,10 +441,20 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
       return this;
     }
 
+    public Builder bodyPrefix(String bodyPrefix) {
+      this.bodyPrefix = bodyPrefix;
+      return this;
+    }
+
+    public Builder bodyPostfix(String bodyPostfix) {
+      this.bodyPostfix = bodyPostfix;
+      return this;
+    }
+
     public ReliableTaildirEventReader build() throws IOException {
       return new ReliableTaildirEventReader(filePaths, headerTable, positionFilePath, skipToEnd,
                                             addByteOffset, cachePatternMatching,
-                                            annotateFileName, fileNameHeader);
+                                            annotateFileName, fileNameHeader, addLineNum,bodyPrefix,bodyPostfix);
     }
   }
 

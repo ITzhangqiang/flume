@@ -130,7 +130,7 @@ public class TaildirMatcher {
       }
     };
 
-    // sanity check
+    // 目录可用性检查
     Preconditions.checkState(parentDir.exists(),
         "Directory does not exist: " + parentDir.getAbsolutePath());
   }
@@ -244,6 +244,7 @@ public class TaildirMatcher {
     for (File f: files) {
       lastModificationTimes.put(f, f.lastModified());
     }
+    //修改时间早的排在前边(合理,优先采集时间早的)
     Collections.sort(files, new Comparator<File>() {
       @Override
       public int compare(File o1, File o2) {

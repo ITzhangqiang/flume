@@ -46,9 +46,17 @@ public class TaildirSourceConfigurationConstants {
   public static final int DEFAULT_WRITE_POS_INTERVAL = 3000;
 
   /** Whether to add the byte offset of a tailed line to the header */
-  public static final String BYTE_OFFSET_HEADER = "byteOffsetHeader";
+  /*public static final String BYTE_OFFSET_HEADER = "byteOffsetHeader";
   public static final String BYTE_OFFSET_HEADER_KEY = "byteoffset";
-  public static final boolean DEFAULT_BYTE_OFFSET_HEADER = false;
+  public static final boolean DEFAULT_BYTE_OFFSET_HEADER = false;*/
+
+  /** Whether to add the line number of a tailed line to the event body */
+  public static final String ADD_LINE_NUMBER_BODY = "addLineNum";
+  public static final boolean DEFAULT_ADD_LINE_NUMBER_BODY = true;
+
+  /** Whether to add the byte offset of a tailed line to the event body */
+  public static final String ADD_BYTE_OFFSET_BODY = "addByteOffset";
+  public static final boolean DEFAULT_ADD_BYTE_OFFSET_BODY = false;
 
   /** Whether to cache the list of files matching the specified file patterns till parent directory
    * is modified.
@@ -67,4 +75,12 @@ public class TaildirSourceConfigurationConstants {
   /** The max number of batch reads from a file in one loop */
   public static final String MAX_BATCH_COUNT = "maxBatchCount";
   public static final Long DEFAULT_MAX_BATCH_COUNT = Long.MAX_VALUE;
+
+  public static final String BODY_PREFIX = "bodyPrefix";
+  public static final String DEFAULT_BODY_PREFIX = "";
+  public static final String BODY_POSTFIX = "bodyPostfix";
+  public static final String DEFAULT_BODY_POSTFIX = "";
+
+  public static final String CHARSET = "charset";
+  public static final String DEFAULT_CHARSET = "utf-8";
 }

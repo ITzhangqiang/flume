@@ -28,10 +28,11 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.charset.Charset;
 import java.util.List;
 import java.util.Map;
 
-import static org.apache.flume.source.taildir.TaildirSourceConfigurationConstants.BYTE_OFFSET_HEADER_KEY;
+import static org.apache.flume.source.taildir.TaildirSourceConfigurationConstants.DEFAULT_CHARSET;
 
 public class TailFile {
   private static final Logger logger = LoggerFactory.getLogger(TailFile.class);
@@ -53,8 +54,9 @@ public class TailFile {
   private byte[] oldBuffer;
   private int bufferPos;
   private long lineReadPos;
+  private long lineNum;
 
-  public TailFile(File file, Map<String, String> headers, long inode, long pos)
+  public TailFile(File file, Map<String, String> headers, long inode, long pos, long lineNum)
       throws IOException {
     this.raf = new RandomAccessFile(file, "r");
     if (pos > 0) {
@@ -64,6 +66,7 @@ public class TailFile {
     this.path = file.getAbsolutePath();
     this.inode = inode;
     this.pos = pos;
+    this.lineNum = lineNum;
     this.lastUpdated = 0L;
     this.needTail = true;
     this.headers = headers;
@@ -91,6 +94,10 @@ public class TailFile {
     return lastUpdated;
   }
 
+  public long getLineNum() {
+    return lineNum;
+  }
+
   public boolean needTail() {
     return needTail;
   }
@@ -107,6 +114,10 @@ public class TailFile {
     this.pos = pos;
   }
 
+  public void setLineNum(long lineNum) {
+    this.lineNum = lineNum;
+  }
+
   public void setLastUpdated(long lastUpdated) {
     this.lastUpdated = lastUpdated;
   }
@@ -119,11 +130,12 @@ public class TailFile {
     this.lineReadPos = lineReadPos;
   }
 
-  public boolean updatePos(String path, long inode, long pos) throws IOException {
+  public boolean updatePos(String path, long inode, long pos, long lineNum) throws IOException {
     if (this.inode == inode && this.path.equals(path)) {
       setPos(pos);
+      setLineNum(lineNum);
       updateFilePos(pos);
-      logger.info("Updated position, file: " + path + ", inode: " + inode + ", pos: " + pos);
+      logger.info("Updated position, file: " + path + ", inode: " + inode + ", pos: " + pos + ", lineNum: " + lineNum);
       return true;
     }
     return false;
@@ -137,10 +149,10 @@ public class TailFile {
 
 
   public List<Event> readEvents(int numEvents, boolean backoffWithoutNL,
-      boolean addByteOffset) throws IOException {
+      boolean addByteOffset, boolean addLineNum, String bodyPrefix, String bodyPostfix) throws IOException {
     List<Event> events = Lists.newLinkedList();
     for (int i = 0; i < numEvents; i++) {
-      Event event = readEvent(backoffWithoutNL, addByteOffset);
+      Event event = readEvent(backoffWithoutNL, addByteOffset, addLineNum, bodyPrefix, bodyPostfix);
       if (event == null) {
         break;
       }
@@ -149,7 +161,7 @@ public class TailFile {
     return events;
   }
 
-  private Event readEvent(boolean backoffWithoutNL, boolean addByteOffset) throws IOException {
+  private Event readEvent(boolean backoffWithoutNL, boolean addByteOffset, boolean addLineNum, String bodyPrefix, String bodyPostfix) throws IOException {
     Long posTmp = getLineReadPos();
     LineResult line = readLine();
     if (line == null) {
@@ -161,10 +173,15 @@ public class TailFile {
       updateFilePos(posTmp);
       return null;
     }
-    Event event = EventBuilder.withBody(line.line);
-    if (addByteOffset == true) {
+    //增加lineNum
+    lineNum++;
+    String lineStr = new String(line.line, DEFAULT_CHARSET);
+    lineStr = formatBody(lineStr, addByteOffset, posTmp, addLineNum, bodyPrefix, bodyPostfix);
+    Event event = EventBuilder.withBody(lineStr,Charset.forName("UTF-8"));
+    /*if (addByteOffset == true) {
       event.getHeaders().put(BYTE_OFFSET_HEADER_KEY, posTmp.toString());
-    }
+    }*///将addByteOffset加到event body中
+
     return event;
   }
 
@@ -233,6 +250,27 @@ public class TailFile {
       bufferPos = NEED_READING;
     }
     return lineResult;
+  }
+
+  private String formatBody(String body, boolean addByteOffset, long posTmp, boolean addLineNum, String bodyPrefix, String bodyPostfix) {
+    StringBuffer sb = new StringBuffer();
+    String sep = "#";
+
+    if (addLineNum == true) {
+        sb.append("s_ln=" + String.valueOf(lineNum));
+        sb.append(sep);
+    }
+
+    if (addByteOffset == true) {
+        sb.append("pos=" + String.valueOf(posTmp));
+        sb.append(sep);
+    }
+
+    sb.append(bodyPrefix);
+    sb.append(body);
+    sb.append(bodyPostfix);
+    //sb.append("\n");
+    return sb.toString();
   }
 
   public void close() {
